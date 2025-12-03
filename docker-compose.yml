@@ -1,0 +1,64 @@
+version: '3.8'
+
+services:
+  # Production service - runs competitive simulation
+  pyairline-rm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pyairline-rm:latest
+    container_name: pyairline-rm
+    volumes:
+      - ./outputs:/app/outputs
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python examples/competitive_simulation.py
+    restart: unless-stopped
+
+  # Basic example service
+  pyairline-basic:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pyairline-rm:latest
+    container_name: pyairline-basic
+    volumes:
+      - ./outputs:/app/outputs
+    command: python examples/basic_example.py
+    profiles:
+      - basic
+
+  # Development service - interactive
+  pyairline-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    image: pyairline-rm:dev
+    container_name: pyairline-dev
+    volumes:
+      - .:/app
+      - ./outputs:/app/outputs
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: /bin/bash
+    stdin_open: true
+    tty: true
+    profiles:
+      - dev
+
+  # Future: Dashboard service (when implemented)
+  pyairline-dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pyairline-rm:latest
+    container_name: pyairline-dashboard
+    volumes:
+      - ./outputs:/app/outputs
+    ports:
+      - "8050:8050"
+    environment:
+      - PYTHONUNBUFFERED=1
+    # command: python dashboard/app.py
+    profiles:
+      - dashboard

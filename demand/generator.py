@@ -1,0 +1,563 @@
+"""
+Demand generation engine for realistic passenger booking requests.
+
+This module generates booking requests with:
+- Poisson arrival processes
+- Log-normal WTP distributions
+- Realistic booking curves (demand varies by DTD)
+- Customer segmentation (business/leisure)
+- Seasonality and special events
+"""
+
+from dataclasses import dataclass, field
+from datetime import datetime, date, timedelta, time
+from typing import List, Dict, Optional, Tuple
+import numpy as np
+from scipy import stats
+import logging
+
+from core.models import (
+    BookingRequest, Customer, CustomerSegment, Airport, 
+    CabinClass, TripType, BookingChannel, MarketConditions
+)
+from core.events import EventManager, BookingRequestEvent, EventType
+
+
+@dataclass
+class DemandStreamConfig:
+    """Configuration for a demand stream (O-D pair with specific characteristics)."""
+    
+    stream_id: str
+    origin: Airport
+    destination: Airport
+    
+    # Demand volume
+    mean_daily_demand: float = 100.0  # Average bookings per day
+    demand_std: float = 20.0  # Standard deviation
+    
+    # Customer segmentation
+    business_proportion: float = 0.30  # 30% business, 70% leisure
+    
+    # WTP distributions (by segment)
+    business_wtp_mean: float = 800.0
+    business_wtp_std: float = 200.0
+    leisure_wtp_mean: float = 300.0
+    leisure_wtp_std: float = 100.0
+    
+    # Booking curve (demand by days to departure)
+    booking_curve: Optional[Dict[int, float]] = None  # {dtd: multiplier}
+    
+    # Temporal patterns
+    seasonality: Optional[Dict[int, float]] = None  # {month: multiplier}
+    day_of_week_pattern: Optional[Dict[int, float]] = None  # {0-6: multiplier}
+    
+    # Advanced booking window
+    mean_advance_purchase: float = 21.0  # Days
+    advance_purchase_std: float = 14.0
+    min_advance_days: int = 0
+    max_advance_days: int = 365
+    
+    # Party size distribution
+    mean_party_size: float = 1.2
+    max_party_size: int = 9
+    
+    # Preferred cabin
+    first_proportion: float = 0.05
+    business_proportion_cabin: float = 0.20
+    premium_economy_proportion: float = 0.15
+    economy_proportion: float = 0.60
+    
+    # Channel distribution
+    direct_online_proportion: float = 0.40
+    direct_mobile_proportion: float = 0.25
+    ota_proportion: float = 0.20
+    gds_proportion: float = 0.10
+    call_center_proportion: float = 0.05
+    
+    def get_default_booking_curve(self) -> Dict[int, float]:
+        """
+        Generate default booking curve.
+        
+        Demand typically peaks around 2-3 weeks before departure
+        for leisure, closer for business.
+        """
+        if self.booking_curve is not None:
+            return self.booking_curve
+        
+        curve = {}
+        for dtd in range(0, 91):  # 0 to 90 days
+            if dtd <= 1:
+                # Very little demand in last 1-2 days
+                curve[dtd] = 0.2
+            elif dtd <= 7:
+                # Increasing as we get closer
+                curve[dtd] = 0.5 + (7 - dtd) * 0.1
+            elif dtd <= 21:
+                # Peak booking period
+                curve[dtd] = 1.2
+            elif dtd <= 45:
+                # Normal demand
+                curve[dtd] = 1.0
+            elif dtd <= 60:
+                # Lower demand far out
+                curve[dtd] = 0.7
+            else:
+                # Very low demand > 60 days out
+                curve[dtd] = 0.4
+        
+        return curve
+
+
+class DemandGenerator:
+    """
+    Generates realistic booking requests for a demand stream.
+    
+    Uses:
+    - Poisson process for arrivals
+    - Log-normal distributions for WTP
+    - Realistic booking curves
+    - Customer segmentation
+    """
+    
+    def __init__(
+        self,
+        config: DemandStreamConfig,
+        random_seed: Optional[int] = None
+    ):
+        """
+        Initialize demand generator.
+        
+        Args:
+            config: Demand stream configuration
+            random_seed: Random seed for reproducibility
+        """
+        self.config = config
+        self.logger = logging.getLogger(f'DemandGenerator.{config.stream_id}')
+        
+        # Random state
+        self.rng = np.random.default_rng(random_seed)
+        
+        # Statistics
+        self.requests_generated = 0
+        self.requests_by_segment: Dict[CustomerSegment, int] = {
+            seg: 0 for seg in CustomerSegment
+        }
+    
+    def generate_requests(
+        self,
+        start_date: date,
+        end_date: date,
+        market_conditions: Optional[MarketConditions] = None
+    ) -> List[BookingRequest]:
+        """
+        Generate all booking requests for date range.
+        
+        Args:
+            start_date: Start of simulation period
+            end_date: End of simulation period
+            market_conditions: Optional market conditions affecting demand
+            
+        Returns:
+            List of booking requests with timestamps
+        """
+        requests = []
+        current_date = start_date
+        
+        while current_date <= end_date:
+            # Generate requests for this day
+            daily_requests = self._generate_daily_requests(
+                current_date, 
+                end_date,
+                market_conditions
+            )
+            requests.extend(daily_requests)
+            current_date += timedelta(days=1)
+        
+        self.logger.info(
+            f"Generated {len(requests)} requests for {self.config.stream_id}"
+        )
+        
+        return requests
+    
+    def _generate_daily_requests(
+        self,
+        booking_date: date,
+        end_date: date,
+        market_conditions: Optional[MarketConditions] = None
+    ) -> List[BookingRequest]:
+        """Generate requests for a single day."""
+        
+        # Determine expected demand for this day
+        base_demand = self.config.mean_daily_demand
+        
+        # Apply day-of-week pattern
+        if self.config.day_of_week_pattern:
+            dow_multiplier = self.config.day_of_week_pattern.get(
+                booking_date.weekday(), 1.0
+            )
+            base_demand *= dow_multiplier
+        
+        # Apply seasonality
+        if self.config.seasonality:
+            season_multiplier = self.config.seasonality.get(
+                booking_date.month, 1.0
+            )
+            base_demand *= season_multiplier
+        
+        # Apply market conditions
+        if market_conditions:
+            base_demand *= market_conditions.seasonality_factor
+        
+        # Sample actual demand (Poisson)
+        num_requests = self.rng.poisson(base_demand)
+        
+        requests = []
+        for _ in range(num_requests):
+            request = self._generate_single_request(booking_date, end_date)
+            if request:
+                requests.append(request)
+        
+        return requests
+    
+    def _generate_single_request(
+        self,
+        booking_date: date,
+        end_date: date
+    ) -> Optional[BookingRequest]:
+        """Generate a single booking request."""
+        
+        # Determine customer segment
+        segment = self._sample_customer_segment()
+        
+        # Generate departure date based on advance purchase
+        departure_date = self._sample_departure_date(booking_date, end_date)
+        if departure_date is None:
+            return None
+        
+        # Calculate days to departure
+        dtd = (departure_date - booking_date).days
+        
+        # Apply booking curve - reject if demand is low for this DTD
+        booking_curve = self.config.get_default_booking_curve()
+        curve_multiplier = booking_curve.get(dtd, 0.5)
+        
+        # Probabilistic rejection based on booking curve
+        if self.rng.random() > curve_multiplier:
+            return None
+        
+        # Generate customer
+        customer = self._generate_customer(segment, dtd)
+        
+        # Generate request timestamp (random time during day)
+        hour = self.rng.integers(0, 24)
+        minute = self.rng.integers(0, 60)
+        second = self.rng.integers(0, 60)
+        request_time = datetime.combine(
+            booking_date, 
+            time(hour, minute, second)
+        )
+        
+        # Preferred departure time (business travelers more specific)
+        if segment == CustomerSegment.BUSINESS:
+            # Business prefer morning or evening
+            if self.rng.random() < 0.6:
+                pref_hour = self.rng.choice([6, 7, 8, 17, 18, 19])
+            else:
+                pref_hour = self.rng.integers(6, 22)
+        else:
+            # Leisure more flexible
+            pref_hour = self.rng.integers(6, 22) if self.rng.random() < 0.5 else None
+        
+        preferred_departure_time = time(pref_hour, 0) if pref_hour else None
+        
+        # Party size
+        party_size = self._sample_party_size(segment)
+        
+        # Preferred cabin
+        preferred_cabin = self._sample_preferred_cabin(segment)
+        
+        # Trip type
+        trip_type = self._sample_trip_type(segment)
+        
+        # Channel
+        channel = self._sample_booking_channel(segment)
+        
+        # Create request
+        request = BookingRequest(
+            request_time=request_time,
+            customer=customer,
+            origin=self.config.origin,
+            destination=self.config.destination,
+            departure_date=departure_date,
+            preferred_departure_time=preferred_departure_time,
+            party_size=party_size,
+            preferred_cabin=preferred_cabin,
+            trip_type=trip_type,
+            channel=channel
+        )
+        
+        self.requests_generated += 1
+        self.requests_by_segment[segment] += 1
+        
+        return request
+    
+    def _sample_customer_segment(self) -> CustomerSegment:
+        """Sample customer segment."""
+        if self.rng.random() < self.config.business_proportion:
+            return CustomerSegment.BUSINESS
+        else:
+            return CustomerSegment.LEISURE
+    
+    def _sample_departure_date(
+        self,
+        booking_date: date,
+        end_date: date
+    ) -> Optional[date]:
+        """Sample departure date based on advance purchase distribution."""
+        
+        # Sample advance purchase days (truncated normal)
+        advance_days = self.rng.normal(
+            self.config.mean_advance_purchase,
+            self.config.advance_purchase_std
+        )
+        
+        # Clip to valid range
+        advance_days = int(np.clip(
+            advance_days,
+            self.config.min_advance_days,
+            self.config.max_advance_days
+        ))
+        
+        departure_date = booking_date + timedelta(days=advance_days)
+        
+        # Must be within simulation period
+        if departure_date > end_date:
+            return None
+        
+        return departure_date
+    
+    def _generate_customer(
+        self,
+        segment: CustomerSegment,
+        dtd: int
+    ) -> Customer:
+        """Generate customer with attributes."""
+        
+        # Willingness to pay (log-normal distribution)
+        if segment == CustomerSegment.BUSINESS:
+            wtp = self.rng.lognormal(
+                mean=np.log(self.config.business_wtp_mean),
+                sigma=self.config.business_wtp_std / self.config.business_wtp_mean
+            )
+        else:
+            wtp = self.rng.lognormal(
+                mean=np.log(self.config.leisure_wtp_mean),
+                sigma=self.config.leisure_wtp_std / self.config.leisure_wtp_mean
+            )
+        
+        # Price sensitivity (leisure more price sensitive)
+        if segment == CustomerSegment.BUSINESS:
+            price_sensitivity = self.rng.uniform(0.5, 1.0)
+            time_sensitivity = self.rng.uniform(1.0, 1.5)
+        else:
+            price_sensitivity = self.rng.uniform(1.0, 1.8)
+            time_sensitivity = self.rng.uniform(0.5, 1.0)
+        
+        # Loyalty (random)
+        loyalty_score = self.rng.beta(2, 5)  # Skewed toward low loyalty
+        
+        customer = Customer(
+            segment=segment,
+            willingness_to_pay=wtp,
+            advance_purchase_days=dtd,
+            price_sensitivity=price_sensitivity,
+            time_sensitivity=time_sensitivity,
+            loyalty_score=loyalty_score
+        )
+        
+        return customer
+    
+    def _sample_party_size(self, segment: CustomerSegment) -> int:
+        """Sample party size."""
+        if segment == CustomerSegment.BUSINESS:
+            # Business mostly travel alone
+            return 1 if self.rng.random() < 0.9 else 2
+        else:
+            # Leisure vary more
+            size = self.rng.poisson(self.config.mean_party_size)
+            return max(1, min(size, self.config.max_party_size))
+    
+    def _sample_preferred_cabin(self, segment: CustomerSegment) -> CabinClass:
+        """Sample preferred cabin class."""
+        
+        # Business travelers prefer higher cabins
+        if segment == CustomerSegment.BUSINESS:
+            probs = [0.10, 0.40, 0.20, 0.30]  # F, J, W, Y
+        else:
+            probs = [0.02, 0.08, 0.10, 0.80]  # F, J, W, Y
+        
+        cabins = [CabinClass.FIRST, CabinClass.BUSINESS, 
+                  CabinClass.PREMIUM_ECONOMY, CabinClass.ECONOMY]
+        
+        return self.rng.choice(cabins, p=probs)
+    
+    def _sample_trip_type(self, segment: CustomerSegment) -> TripType:
+        """Sample trip type."""
+        if segment == CustomerSegment.BUSINESS:
+            # Business often one-way
+            return self.rng.choice(
+                [TripType.ONE_WAY, TripType.ROUND_TRIP],
+                p=[0.6, 0.4]
+            )
+        else:
+            # Leisure mostly round-trip
+            return self.rng.choice(
+                [TripType.ONE_WAY, TripType.ROUND_TRIP],
+                p=[0.2, 0.8]
+            )
+    
+    def _sample_booking_channel(self, segment: CustomerSegment) -> BookingChannel:
+        """Sample booking channel."""
+        
+        if segment == CustomerSegment.BUSINESS:
+            # Business use more GDS and corporate tools
+            channels = [
+                BookingChannel.DIRECT_ONLINE,
+                BookingChannel.DIRECT_MOBILE,
+                BookingChannel.GDS,
+                BookingChannel.CORPORATE,
+                BookingChannel.CALL_CENTER
+            ]
+            probs = [0.30, 0.20, 0.25, 0.20, 0.05]
+        else:
+            # Leisure use more OTA
+            channels = [
+                BookingChannel.DIRECT_ONLINE,
+                BookingChannel.DIRECT_MOBILE,
+                BookingChannel.OTA,
+                BookingChannel.CALL_CENTER
+            ]
+            probs = [0.35, 0.30, 0.30, 0.05]
+        
+        return self.rng.choice(channels, p=probs)
+    
+    def get_statistics(self) -> Dict[str, any]:
+        """Get generation statistics."""
+        return {
+            'stream_id': self.config.stream_id,
+            'total_requests': self.requests_generated,
+            'by_segment': dict(self.requests_by_segment),
+            'mean_daily_demand': self.config.mean_daily_demand
+        }
+
+
+class MultiStreamDemandGenerator:
+    """
+    Manages multiple demand streams and generates all requests.
+    
+    This coordinates demand generation across multiple O-D pairs.
+    """
+    
+    def __init__(
+        self,
+        stream_configs: List[DemandStreamConfig],
+        random_seed: Optional[int] = None
+    ):
+        """
+        Initialize multi-stream generator.
+        
+        Args:
+            stream_configs: List of demand stream configurations
+            random_seed: Base random seed
+        """
+        self.stream_configs = stream_configs
+        self.logger = logging.getLogger('MultiStreamDemandGenerator')
+        
+        # Create generator for each stream
+        self.generators: Dict[str, DemandGenerator] = {}
+        for i, config in enumerate(stream_configs):
+            seed = random_seed + i if random_seed else None
+            self.generators[config.stream_id] = DemandGenerator(config, seed)
+    
+    def generate_all_requests(
+        self,
+        start_date: date,
+        end_date: date,
+        market_conditions: Optional[MarketConditions] = None
+    ) -> List[BookingRequest]:
+        """
+        Generate requests for all streams.
+        
+        Args:
+            start_date: Simulation start date
+            end_date: Simulation end date
+            market_conditions: Market conditions
+            
+        Returns:
+            Combined list of all booking requests
+        """
+        all_requests = []
+        
+        for stream_id, generator in self.generators.items():
+            self.logger.info(f"Generating demand for stream: {stream_id}")
+            requests = generator.generate_requests(
+                start_date,
+                end_date,
+                market_conditions
+            )
+            all_requests.extend(requests)
+        
+        # Sort by request time
+        all_requests.sort(key=lambda r: r.request_time)
+        
+        self.logger.info(f"Generated {len(all_requests)} total requests")
+        
+        return all_requests
+    
+    def add_requests_to_event_queue(
+        self,
+        event_manager: EventManager,
+        requests: List[BookingRequest]
+    ) -> int:
+        """
+        Add booking requests to event queue.
+        
+        Args:
+            event_manager: Event manager to add to
+            requests: List of booking requests
+            
+        Returns:
+            Number of events added
+        """
+        for request in requests:
+            # Determine which stream this request came from
+            stream_id = f"{request.origin.code}-{request.destination.code}"
+            
+            event_manager.create_and_add_event(
+                timestamp=request.request_time,
+                event_type=EventType.BOOKING_REQUEST,
+                data=BookingRequestEvent(
+                    request=request,
+                    demand_stream_id=stream_id
+                ),
+                priority=2  # Normal priority
+            )
+        
+        return len(requests)
+    
+    def get_total_statistics(self) -> Dict[str, any]:
+        """Get combined statistics from all streams."""
+        stats = {
+            'num_streams': len(self.generators),
+            'streams': {}
+        }
+        
+        total_requests = 0
+        for stream_id, generator in self.generators.items():
+            stream_stats = generator.get_statistics()
+            stats['streams'][stream_id] = stream_stats
+            total_requests += stream_stats['total_requests']
+        
+        stats['total_requests'] = total_requests
+        
+        return stats

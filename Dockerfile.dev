@@ -1,0 +1,45 @@
+# PyAirline RM - Development Dockerfile
+# This version includes development tools and allows for live code changes
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+# Install system dependencies including dev tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    build-essential \
+    git \
+    vim \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements.txt .
+
+# Install Python dependencies including dev tools
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir \
+    ipython \
+    jupyter \
+    pytest \
+    black \
+    flake8
+
+# Copy application
+COPY . .
+
+# Install in development mode
+RUN pip install -e .
+
+# Create outputs directory
+RUN mkdir -p /app/outputs
+
+# Default to bash for interactive development
+CMD ["/bin/bash"]
+
+EXPOSE 8050 8888
