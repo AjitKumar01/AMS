@@ -10,12 +10,13 @@
 4.  [Simulation Engine](#4-simulation-engine)
 5.  [Demand Generation Module](#5-demand-generation-module)
 6.  [Customer Choice Modeling](#6-customer-choice-modeling)
-7.  [Revenue Management Optimization](#7-revenue-management-optimization)
-8.  [Overbooking Module](#8-overbooking-module)
-9.  [Personalization Engine](#9-personalization-engine)
-10. [API & User Interface](#10-api--user-interface)
-11. [Database Schema](#11-database-schema)
-12. [Appendix: Code-to-Formula Mapping](#12-appendix-code-to-formula-mapping)
+7.  [Demand Forecasting](#7-demand-forecasting)
+8.  [Revenue Management Optimization](#8-revenue-management-optimization)
+9.  [Overbooking Module](#9-overbooking-module)
+10. [Personalization Engine](#10-personalization-engine)
+11. [API & User Interface](#11-api--user-interface)
+12. [Database Schema](#12-database-schema)
+13. [Appendix: Code-to-Formula Mapping](#13-appendix-code-to-formula-mapping)
 
 ---
 
@@ -70,6 +71,7 @@ graph TD
         EMSR[EMSR-b Optimizer - rm/optimizer.py]
         DP[Dynamic Programming - rm/optimizer.py]
         MC[Monte Carlo - rm/optimizer.py]
+        BP[Bid Price Optimizer - rm/bid_price_optimizer.py]
     end
 
     subgraph "Overbooking Module"
@@ -106,6 +108,7 @@ graph TD
 | **Choice Models** | `choice/models.py` | Customer decision logic (MNL, Buy-up/down) |
 | **FRAT5** | `choice/frat5.py` | Sell-up probability curves |
 | **RM Optimizer** | `rm/optimizer.py` | EMSR-b, EMSR-a, DP, Monte Carlo algorithms |
+| **Bid Price Optimizer** | `rm/bid_price_optimizer.py` | Heuristic bid price control |
 | **Overbooking** | `overbooking/optimizer.py` | No-show modeling, overbooking limits |
 | **Personalization** | `core/personalization.py` | Loyalty discounts, ancillary bundling |
 | **API** | `api/server.py` | FastAPI REST endpoints |
@@ -336,9 +339,159 @@ Where:
 
 ---
 
-## 7. Revenue Management Optimization
+## 7. Demand Forecasting
 
-### 7.1 EMSR-b Algorithm
+The forecasting module (`demand/forecaster.py`) provides multiple methods to predict future demand, which directly feeds into RM optimization.
+
+### 7.1 Available Forecasting Methods
+
+| Method | Enum Value | Description |
+|:---|:---|:---|
+| Historical Average | `HISTORICAL_AVERAGE` | Simple mean of past bookings |
+| Pickup | `PICKUP` | Industry-standard method |
+| Additive Pickup | `ADDITIVE_PICKUP` | Adds absolute expected bookings |
+| Multiplicative Pickup | `MULTIPLICATIVE_PICKUP` | Multiplies by booking curve factor |
+| Exponential Smoothing | `EXPONENTIAL_SMOOTHING` | Weighted average with decay |
+| Neural Network | `NEURAL_NETWORK` | ML-based (requires PyTorch) |
+| Ensemble | `ENSEMBLE` | Combines multiple methods |
+
+### 7.2 Pickup Method (Industry Standard)
+
+The pickup method estimates final demand by extrapolating current bookings using historical booking curves.
+
+**Core Concept:**
+
+$$\text{Final Demand} = \text{Current Bookings} \times \text{Pickup Factor}(DTD)$$
+
+**Pickup Factor Curve (from `forecaster.py` lines 510-525):**
+
+The pickup factor represents what multiplier to apply to current bookings to estimate final demand. It's based on typical S-curve booking patterns:
+
+| Days Before Departure | Cumulative Booking % | Pickup Factor |
+|:---|:---|:---|
+| 90+ days | 15% | 6.67 |
+| 60 days | 30% | 3.33 |
+| 30 days | 55% | 1.82 |
+| 14 days | 75% | 1.33 |
+| 7 days | 90% | 1.11 |
+| 0 days (departure) | 100% | 1.00 |
+
+**Code (lines 510-529):**
+```python
+def _get_pickup_factor(self, days_before: int) -> float:
+    if days_before <= 0:
+        factor = 1.0
+    elif days_before <= 7:
+        factor = 0.90 + (7 - days_before) * 0.01
+    elif days_before <= 14:
+        factor = 0.75 + (14 - days_before) * 0.015
+    elif days_before <= 30:
+        factor = 0.55 + (30 - days_before) * 0.0125
+    elif days_before <= 60:
+        factor = 0.30 + (60 - days_before) * 0.0083
+    elif days_before <= 90:
+        factor = 0.15 + (90 - days_before) * 0.005
+    else:
+        factor = 0.15
+    
+    return 1.0 / factor  # Convert to multiplier
+```
+
+### 7.3 Additive vs. Multiplicative Pickup
+
+**Additive Pickup:**
+$$\hat{D}_{final} = D_{current} + \hat{\Delta}(DTD)$$
+
+Where $\hat{\Delta}(DTD)$ is the expected additional bookings to come.
+
+**Multiplicative Pickup:**
+$$\hat{D}_{final} = D_{current} \times m(DTD)$$
+
+Where $m(DTD)$ is the multiplier from the pickup curve.
+
+**Code (lines 459-479):**
+```python
+if self.method == ForecastMethod.ADDITIVE_PICKUP:
+    pickup = self._get_additive_pickup(booking_class, days_before)
+    forecast.forecasts[booking_class] = current + pickup
+elif self.method == ForecastMethod.MULTIPLICATIVE_PICKUP:
+    if current > 0:
+        forecast.forecasts[booking_class] = current * pickup_factor
+```
+
+### 7.4 Exponential Smoothing
+
+Balances recent observations with historical averages using smoothing parameter $\alpha$:
+
+$$\hat{D}_t = \alpha \cdot D_{current} + (1 - \alpha) \cdot \bar{D}_{historical}$$
+
+**Default:** $\alpha = 0.3$
+
+**Code (lines 577-593):**
+```python
+alpha = 0.3
+for booking_class in BookingClass:
+    historical = self._get_average_demand(booking_class)
+    current = current_bookings.get(booking_class, 0)
+    smoothed = alpha * current + (1 - alpha) * historical
+    forecast.forecasts[booking_class] = max(smoothed, current)
+```
+
+### 7.5 Neural Network Forecasting
+
+When PyTorch is available, a 3-layer neural network can be used:
+
+**Architecture (lines 677-689):**
+```
+Input (4) → Linear(64) → ReLU → Linear(64) → ReLU → Linear(1) → Sigmoid
+```
+
+**Features:**
+- Normalized days to departure: $DTD / 90$
+- Day of week: $\text{weekday} / 7$
+- Month: $\text{month} / 12$
+- Current load factor: $\text{booked} / \text{capacity}$
+
+### 7.6 Demand Unconstraining with FRAT5
+
+When historical demand was constrained (classes closed), the forecaster estimates true demand using FRAT5 sell-up curves:
+
+$$D_{true} = D_{observed} + D_{spilled}$$
+
+Where spilled demand is estimated from observed buy-ups:
+$$D_{spilled} = \frac{N_{buyup} \times (1 - P_{sellup})}{P_{sellup}}$$
+
+**Code (lines 344-349):**
+```python
+lost_demand = estimated_sellup_pax * (1 - avg_sellup_prob) / avg_sellup_prob
+unconstrained[current_class] += lost_demand
+```
+
+### 7.7 Forecast Accuracy Tracking
+
+The system tracks multiple accuracy metrics (lines 42-71):
+
+| Metric | Formula | Purpose |
+|:---|:---|:---|
+| MAE | $\frac{1}{n}\sum\|F_i - A_i\|$ | Average absolute error |
+| MAPE | $\frac{100}{n}\sum\frac{\|F_i - A_i\|}{A_i}$ | Percentage error |
+| Bias | $\frac{1}{n}\sum(F_i - A_i)$ | Systematic over/under forecasting |
+
+**Revenue Impact Estimation (lines 738-753):**
+```python
+if forecast_error > 0:
+    # Under-forecasted: spilled high-value demand
+    revenue_loss = spilled_demand * fare * 1.5
+else:
+    # Over-forecasted: accepted low-value bookings
+    revenue_loss = excess_protection * fare * 0.3
+```
+
+---
+
+## 8. Revenue Management Optimization
+
+### 8.1 EMSR-b Algorithm
 
 EMSR-b (Expected Marginal Seat Revenue, version b) is the industry-standard algorithm.
 
@@ -398,7 +551,7 @@ for j in range(n - 1):
     booking_limits[class_next] = limit
 ```
 
-### 7.2 Dynamic Programming Optimizer
+### 8.2 Dynamic Programming Optimizer
 
 The DP approach uses Bellman's equation for exact optimization.
 
@@ -411,7 +564,7 @@ Where:
 - $x$ = remaining capacity
 - $r$ = fare of arriving request
 
-### 7.3 Available Optimization Methods
+### 8.3 Available Optimization Methods
 
 | Method | Class | Complexity | Use Case |
 |:---|:---|:---|:---|
@@ -419,12 +572,97 @@ Where:
 | EMSR-a | `EMSRaOptimizer` | O(n) | Simpler, faster |
 | DP | `DynamicProgrammingOptimizer` | O(T×C×n) | Exact optimal |
 | Monte Carlo | `MonteCarloOptimizer` | O(trials×events) | Stochastic scenarios |
+| **Bid Price** | `HeuristicBidPriceOptimizer` | O(n) | Continuous pricing |
+
+### 8.4 Bid Price Optimization
+
+The Bid Price approach (`rm/bid_price_optimizer.py`) represents a modern alternative to booking limit controls. Instead of opening/closing classes, it sets a **threshold price** for accepting bookings.
+
+**Concept:**
+A bid price represents the **marginal value of capacity**. A booking request is accepted if and only if:
+
+$$\text{Fare}_{request} \geq \text{Bid Price}$$
+
+**Heuristic Bid Price Algorithm (lines 23-84):**
+
+**Step 1: Calculate Scarcity Factor**
+
+$$\text{Scarcity} = \frac{\text{Expected Remaining Demand}}{\text{Remaining Seats}}$$
+
+**Code (lines 55-60):**
+```python
+if remaining_seats > 0:
+    scarcity = total_expected_demand / remaining_seats
+else:
+    scarcity = 10.0  # Very high (sold out)
+```
+
+**Step 2: Calculate Bid Price with Quadratic Penalty**
+
+$$\text{Bid Price} = f_{min} \times (\text{Scarcity})^2$$
+
+Where $f_{min}$ is the lowest available fare. The quadratic penalty makes bid price rise sharply as capacity becomes scarce.
+
+**Code (lines 65-70):**
+```python
+bid_price = min_fare * (scarcity ** 2)
+bid_price = min(bid_price, max_fare)  # Cap at maximum fare
+```
+
+**Step 3: Set Class Availability**
+
+Classes are opened if their fare exceeds the bid price:
+
+$$\text{Available}_j = \begin{cases} \text{Remaining Capacity} & \text{if } f_j \geq \text{Bid Price} \\ 0 & \text{otherwise} \end{cases}$$
+
+**Code (lines 74-78):**
+```python
+for bc, fare in fares.items():
+    if fare >= bid_price:
+        booking_limits[bc] = remaining_seats
+    else:
+        booking_limits[bc] = 0
+```
+
+**Example Calculation:**
+
+| State | Value |
+|:---|:---|
+| Remaining Seats | 30 |
+| Expected Demand | 45 |
+| Min Fare (Class L) | $150 |
+| Scarcity Factor | 45/30 = 1.5 |
+| Bid Price | $150 × 1.5² = $337.50 |
+
+With this bid price:
+- Class Y ($400) → **OPEN**
+- Class B ($350) → **OPEN**
+- Class M ($300) → **CLOSED**
+- Class L ($150) → **CLOSED**
+
+### 8.5 DP-Based Bid Prices
+
+The Dynamic Programming optimizer also calculates bid prices as the marginal value of capacity:
+
+$$\pi(x) = V(t, x) - V(t, x+1)$$
+
+Where $V(t, x)$ is the expected revenue with $x$ seats remaining at time $t$.
+
+**Code (lines 353-359 of `rm/optimizer.py`):**
+```python
+for x in range(capacity):
+    if x < capacity - 1:
+        bid_price = V[0][x] - V[0][x + 1]
+    else:
+        bid_price = 0
+    bid_prices.append(max(0, bid_price))
+```
 
 ---
 
-## 8. Overbooking Module
+## 9. Overbooking Module
 
-### 8.1 No-Show Probability Model
+### 9.1 No-Show Probability Model
 
 **Base Rates by Segment (Verified from `overbooking/optimizer.py` lines 45-51):**
 
@@ -448,7 +686,7 @@ Where:
 - Within 7 days: 40% reduction
 - Within 21 days: 20% reduction
 
-### 8.2 Show-Up Distribution
+### 9.2 Show-Up Distribution
 
 The total show-ups follow a **Poisson-Binomial distribution**, approximated by Normal:
 
@@ -462,7 +700,7 @@ $$E[\max(0, S - C)] = \sigma \left[\phi(z) - z(1 - \Phi(z))\right]$$
 
 Where $z = \frac{C - \mu}{\sigma}$, $\phi$ is the PDF, $\Phi$ is the CDF.
 
-### 8.3 Denied Boarding Costs (lines 218-243)
+### 9.3 Denied Boarding Costs (lines 218-243)
 
 | Delay | Compensation |
 |:---|:---|
@@ -475,9 +713,9 @@ Additional costs: Rebooking ($150), Accommodation ($200), Goodwill ($300).
 
 ---
 
-## 9. Personalization Engine
+## 10. Personalization Engine
 
-### 9.1 Loyalty Tier Assignment (Verified from `core/personalization.py` lines 62-72)
+### 10.1 Loyalty Tier Assignment (Verified from `core/personalization.py` lines 62-72)
 
 | Segment | None | Silver | Gold | Platinum |
 |:---|:---|:---|:---|:---|
@@ -485,14 +723,14 @@ Additional costs: Rebooking ($150), Accommodation ($200), Goodwill ($300).
 | PREMIUM_LEISURE | 60% | 30% | 10% | 0% |
 | Others | 90% | 8% | 2% | 0% |
 
-### 9.2 Loyalty Discounts (lines 105-112)
+### 10.2 Loyalty Discounts (lines 105-112)
 
 | Tier | Discount |
 |:---|:---|
 | Gold | 5% |
 | Platinum | 10% |
 
-### 9.3 Ancillary Bundling (lines 116-139)
+### 10.3 Ancillary Bundling (lines 116-139)
 
 **Bundle Discount:** 20% off ancillary prices when bundled with ticket.
 
@@ -508,9 +746,9 @@ Additional costs: Rebooking ($150), Accommodation ($200), Goodwill ($300).
 
 ---
 
-## 10. API & User Interface
+## 11. API & User Interface
 
-### 10.1 REST API Endpoints (from `api/server.py`)
+### 11.1 REST API Endpoints (from `api/server.py`)
 
 | Method | Endpoint | Description |
 |:---|:---|:---|
@@ -522,7 +760,7 @@ Additional costs: Rebooking ($150), Accommodation ($200), Goodwill ($300).
 | GET | `/simulations/{id}/db/{table}/csv` | Download CSV |
 | GET | `/airports/{code}` | Get airport info |
 
-### 10.2 Simulation Parameters (lines 55-106)
+### 11.2 Simulation Parameters (lines 55-106)
 
 | Parameter | Type | Default | Description |
 |:---|:---|:---|:---|
@@ -534,9 +772,9 @@ Additional costs: Rebooking ($150), Accommodation ($200), Goodwill ($300).
 
 ---
 
-## 11. Database Schema
+## 12. Database Schema
 
-### 11.1 `customers` Table
+### 12.1 `customers` Table
 
 | Column | Type | Description |
 |:---|:---|:---|
@@ -548,7 +786,7 @@ Additional costs: Rebooking ($150), Accommodation ($200), Goodwill ($300).
 | `loyalty_tier` | TEXT | NONE, SILVER, GOLD, PLATINUM |
 | `ancillary_prefs` | TEXT | Pipe-separated preferences |
 
-### 11.2 `bookings` Table
+### 12.2 `bookings` Table
 
 | Column | Type | Description |
 |:---|:---|:---|
@@ -561,7 +799,7 @@ Additional costs: Rebooking ($150), Accommodation ($200), Goodwill ($300).
 | `is_personalized` | BOOLEAN | Was offer personalized |
 | `is_cancelled` | BOOLEAN | Cancellation status |
 
-### 11.3 `flights` Table
+### 12.3 `flights` Table
 
 | Column | Type | Description |
 |:---|:---|:---|
@@ -574,7 +812,7 @@ Additional costs: Rebooking ($150), Accommodation ($200), Goodwill ($300).
 
 ---
 
-## 12. Appendix: Code-to-Formula Mapping
+## 13. Appendix: Code-to-Formula Mapping
 
 ### Price Elasticity (from `demand/elasticity.py` lines 26-31)
 
