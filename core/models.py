@@ -8,7 +8,7 @@ bookings, inventory, customers, and other core entities.
 from dataclasses import dataclass, field
 from datetime import datetime, date, time, timedelta
 from enum import Enum
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Any
 from decimal import Decimal
 import uuid
 
@@ -62,6 +62,7 @@ class CustomerSegment(Enum):
     """Customer market segments."""
     BUSINESS = "business"
     LEISURE = "leisure"
+    PREMIUM_LEISURE = "premium_leisure"
     VFR = "vfr"  # Visiting Friends and Relatives
     GROUP = "group"
 
@@ -272,6 +273,10 @@ class Customer:
     frequent_flyer_tier: Optional[str] = None
     loyalty_score: float = 0.0  # 0.0 to 1.0
     
+    # Personalization
+    ancillary_preferences: List[str] = field(default_factory=list)
+    loyalty_tier: Any = None # To store the Enum from personalization engine
+    
     def __str__(self) -> str:
         return f"Customer({self.segment.value}, WTP=${self.willingness_to_pay:.0f})"
 
@@ -325,6 +330,11 @@ class TravelSolution:
     base_fare: float = 0.0
     taxes_fees: float = 0.0
     total_price: float = 0.0
+    
+    # Personalization
+    ancillaries: List[str] = field(default_factory=list)
+    is_personalized_offer: bool = False
+    original_price: float = 0.0
     
     # Availability
     available_seats: int = 0

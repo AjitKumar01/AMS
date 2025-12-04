@@ -74,7 +74,24 @@ class SimulationRequest(BaseModel):
     customer_currency: str = Field(default="USD")
     base_currency: str = Field(default="USD")
     
+    # Advanced RM & Forecasting
+    forecast_method: str = Field(default="pickup", description="pickup, additive_pickup, exponential_smoothing, historical_average, multiplicative_pickup, neural_network, xgboost, ensemble")
+    rm_optimization_frequency: int = Field(default=24, description="Frequency of RM optimization in hours")
+    
+    # Advanced Configuration
+    optimization_horizons: List[int] = Field(default=[30, 14, 7, 3, 1], description="Days before departure to run optimization")
+    price_update_frequency_hours: float = Field(default=6.0, description="Frequency of price updates in hours")
+    demand_generation_method: str = Field(default="poisson", description="poisson, stateful")
+    overbooking_method: str = Field(default="critical_fractile", description="critical_fractile, risk_averse")
+    overbooking_risk_tolerance: float = Field(default=0.05, description="Max probability of denied boarding")
+    include_buyup_down: bool = Field(default=True, description="Allow customers to buy up/down")
+    include_recapture: bool = Field(default=True, description="Allow recapture of spilled demand")
+    personalization_enabled: bool = Field(default=False, description="Enable personalized offers")
+    use_db: bool = Field(default=True, description="Enable database storage")
+    
     # Detailed Demand Parameters
+    demand_mean: float = Field(default=100.0, description="Mean daily demand per flight")
+    demand_std: float = Field(default=20.0, description="Standard deviation of daily demand")
     business_proportion: float = Field(default=0.30, ge=0.0, le=1.0)
     business_wtp: float = Field(default=800.0, ge=0.0)
     leisure_wtp: float = Field(default=300.0, ge=0.0)
@@ -147,12 +164,23 @@ def run_simulation_task(sim_id: str, request: SimulationRequest):
             end_date=request.end_date,
             random_seed=request.random_seed,
             rm_method=request.rm_method,
+            rm_optimization_frequency=request.rm_optimization_frequency,
+            forecast_method=request.forecast_method,
             choice_model=request.choice_model,
             dynamic_pricing=request.dynamic_pricing,
             overbooking_enabled=request.overbooking,
-            optimization_horizons=[7, 3, 1], # Reduced horizons for speed
+            optimization_horizons=request.optimization_horizons,
+            price_update_frequency_hours=request.price_update_frequency_hours,
+            demand_generation_method=request.demand_generation_method,
+            overbooking_method=request.overbooking_method,
+            overbooking_risk_tolerance=request.overbooking_risk_tolerance,
+            include_buyup_down=request.include_buyup_down,
+            include_recapture=request.include_recapture,
+            personalization_enabled=request.personalization_enabled,
+            use_db=request.use_db,
+            db_path=f"simulation_results/{sim_id}.db",
             progress_bar=False, # Disable tqdm
-            export_csv=True,
+            export_csv=False,
             customer_currency=request.customer_currency,
             base_currency=request.base_currency,
             currency_rate=currency_rate
@@ -183,11 +211,16 @@ def run_simulation_task(sim_id: str, request: SimulationRequest):
             market.add_airline(airline)
 
         # 4. Setup Forecasters
-        # Use lighter methods for API/Web usage to ensure responsiveness
+        # Use requested method
+        try:
+            forecast_method_enum = ForecastMethod(request.forecast_method)
+        except ValueError:
+            logger.warning(f"Unknown forecast method {request.forecast_method}, defaulting to PICKUP")
+            forecast_method_enum = ForecastMethod.PICKUP
+            
         forecasters = {
-            'AA': DemandForecaster(method=ForecastMethod.PICKUP, track_accuracy=True, add_noise=True, noise_std=0.15),
-            'UA': DemandForecaster(method=ForecastMethod.PICKUP, track_accuracy=True, add_noise=True, noise_std=0.08), # Changed from NEURAL_NETWORK
-            'DL': DemandForecaster(method=ForecastMethod.EXPONENTIAL_SMOOTHING, track_accuracy=True, add_noise=True, noise_std=0.12)
+            code: DemandForecaster(method=forecast_method_enum, track_accuracy=True, add_noise=True, noise_std=0.1)
+            for code in airlines.keys()
         }
 
         simulations[sim_id]["progress"] = 30
@@ -211,19 +244,16 @@ def run_simulation_task(sim_id: str, request: SimulationRequest):
         
         # Apply demand pattern adjustments
         for stream in demand_streams:
-            stream.mean_daily_demand *= request.demand_multiplier
+            # Use explicit mean/std from request
+            stream.mean_daily_demand = request.demand_mean * request.demand_multiplier
+            stream.demand_std = request.demand_std
             
-            # Apply user overrides if provided (simple logic: if pattern is default, use explicit values)
-            # Or just apply explicit values as base and let pattern modify? 
-            # Let's treat explicit values as the target if pattern is 'custom' or just overwrite.
-            # The user asked for "all inputs", so let's use the explicit values directly.
-            
+            # Apply user overrides if provided
             stream.business_proportion = request.business_proportion
             stream.business_wtp_mean = request.business_wtp
             stream.leisure_wtp_mean = request.leisure_wtp
             
-            # Keep the pattern logic as modifiers if needed, or maybe disable it if we have explicit controls?
-            # Let's say pattern modifies the explicit values.
+            # Keep the pattern logic as modifiers if needed
             if request.demand_pattern == "high_business":
                 stream.business_proportion = min(0.8, stream.business_proportion * 1.5)
                 stream.business_wtp_mean *= 1.2
@@ -423,6 +453,95 @@ def get_airport(code: str):
         latitude=row[4],
         longitude=row[5]
     )
+
+@app.get("/simulations/{sim_id}/db/tables")
+def get_db_tables(sim_id: str):
+    """List tables in the simulation database."""
+    db_path = Path(f"simulation_results/{sim_id}.db")
+    if not db_path.exists():
+        raise HTTPException(status_code=404, detail="Database not found")
+        
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    tables = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return {"tables": tables}
+
+@app.get("/simulations/{sim_id}/db/{table_name}")
+def get_table_data(sim_id: str, table_name: str, limit: int = 100):
+    """Get data from a table."""
+    db_path = Path(f"simulation_results/{sim_id}.db")
+    if not db_path.exists():
+        raise HTTPException(status_code=404, detail="Database not found")
+        
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    
+    try:
+        # Use parameterized query for table name is not possible directly, 
+        # but we can validate against list of tables first
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = [row[0] for row in cursor.fetchall()]
+        if table_name not in tables:
+            raise HTTPException(status_code=404, detail="Table not found")
+            
+        cursor.execute(f"SELECT * FROM {table_name} LIMIT ?", (limit,))
+        rows = [dict(row) for row in cursor.fetchall()]
+        return rows
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/simulations/{sim_id}/db/{table_name}/csv")
+def download_table_csv(sim_id: str, table_name: str):
+    """Download table as CSV."""
+    import csv
+    import io
+    from fastapi.responses import StreamingResponse
+    
+    db_path = Path(f"simulation_results/{sim_id}.db")
+    if not db_path.exists():
+        raise HTTPException(status_code=404, detail="Database not found")
+        
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = [row[0] for row in cursor.fetchall()]
+        if table_name not in tables:
+            raise HTTPException(status_code=404, detail="Table not found")
+            
+        cursor.execute(f"SELECT * FROM {table_name}")
+        
+        # Create CSV in memory
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # Write header
+        if cursor.description:
+            writer.writerow([d[0] for d in cursor.description])
+            
+        # Write rows
+        for row in cursor:
+            writer.writerow(row)
+            
+        output.seek(0)
+        
+        return StreamingResponse(
+            io.BytesIO(output.getvalue().encode()),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={table_name}.csv"}
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
 
 if __name__ == "__main__":
     import uvicorn

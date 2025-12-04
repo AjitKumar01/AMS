@@ -37,15 +37,17 @@ def main():
     with st.sidebar.form("sim_config"):
         st.subheader("Time Period")
         col1, col2 = st.columns(2)
-        start_date = col1.date_input("Start Date", date(2025, 12, 1))
-        end_date = col2.date_input("End Date", date(2025, 12, 7))
+        start_date = col1.date_input("Flight Departure Start Date", date(2025, 12, 1))
+        end_date = col2.date_input("Flight Departure End Date", date(2025, 12, 7))
         
         st.subheader("Market Parameters")
         demand_multiplier = st.slider("Demand Multiplier", 0.1, 5.0, 1.0, 0.1)
         demand_pattern = st.selectbox("Demand Pattern", ["default", "high_business", "high_leisure"])
         
         # Detailed Demand Inputs
-        with st.expander("Detailed Demand Settings"):
+        with st.expander("Detailed Demand Settings", expanded=True):
+            demand_mean = st.number_input("Mean Total Demand per Flight", value=150.0, step=10.0, help="Average total bookings per flight (Normal Dist)")
+            demand_std = st.number_input("Demand Std Dev", value=30.0, step=5.0, help="Standard deviation of total demand")
             business_proportion = st.slider("Business Traveler %", 0.0, 1.0, 0.30, 0.05)
             business_wtp = st.number_input("Business WTP Mean ($)", value=800.0, step=50.0)
             leisure_wtp = st.number_input("Leisure WTP Mean ($)", value=300.0, step=50.0)
@@ -197,6 +199,8 @@ def main():
             "single_flight_mode": single_flight_mode,
             "customer_currency": customer_currency,
             "base_currency": base_currency,
+            "demand_mean": demand_mean,
+            "demand_std": demand_std,
             "business_proportion": business_proportion,
             "business_wtp": business_wtp,
             "leisure_wtp": leisure_wtp,

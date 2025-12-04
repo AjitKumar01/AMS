@@ -24,6 +24,11 @@ def check_api_health():
 def main():
     st.title("✈️ PyAirline Revenue Management Simulator")
     
+    if "sim_id" not in st.session_state:
+        st.session_state.sim_id = None
+    if "sim_completed" not in st.session_state:
+        st.session_state.sim_completed = False
+    
     # Sidebar - Configuration
     st.sidebar.header("Simulation Settings")
     
@@ -46,16 +51,34 @@ def main():
         
         # Detailed Demand Inputs
         with st.expander("Detailed Demand Settings"):
+            st.markdown("### Customer Segments")
             business_proportion = st.slider("Business Traveler %", 0.0, 1.0, 0.30, 0.05)
-            business_wtp = st.number_input("Business WTP Mean ($)", value=800.0, step=50.0)
-            leisure_wtp = st.number_input("Leisure WTP Mean ($)", value=300.0, step=50.0)
+            
+            st.markdown("### Willingness To Pay (Mean)")
+            col_wtp1, col_wtp2 = st.columns(2)
+            business_wtp = col_wtp1.number_input("Business ($)", value=800.0, step=50.0)
+            leisure_wtp = col_wtp2.number_input("Leisure ($)", value=300.0, step=50.0)
+            
+            st.markdown("### Advanced Parameters")
+            forecast_smoothing = st.slider("Forecast Smoothing Factor (Alpha)", 0.0, 1.0, 0.2, 0.05)
+            rm_frequency = st.selectbox("RM Optimization Frequency", ["daily", "12h", "6h", "realtime"])
         
         st.subheader("Network & Airlines")
         selected_airlines = st.multiselect("Select Airlines", ["AA", "UA", "DL"], default=["AA", "UA", "DL"])
         single_flight_mode = st.checkbox("Single Flight Mode (JFK-LAX only)", False)
         
         st.subheader("RM Strategy")
-        rm_method = st.selectbox("RM Method", ["EMSR-b", "EMSR-a", "Simple"])
+        rm_method = st.selectbox("RM Method", ["EMSR-b", "BidPrice", "EMSR-a", "Simple"])
+        forecast_method = st.selectbox("Forecast Method", [
+            "pickup", 
+            "additive_pickup", 
+            "multiplicative_pickup",
+            "exponential_smoothing", 
+            "historical_average",
+            "neural_network",
+            "xgboost",
+            "ensemble"
+        ])
         choice_model = st.selectbox("Choice Model", ["mnl", "enhanced", "cheapest", "custom"])
         
         # Custom Choice Parameters
@@ -70,6 +93,23 @@ def main():
         st.subheader("Features")
         dynamic_pricing = st.checkbox("Dynamic Pricing", True)
         overbooking = st.checkbox("Overbooking", True)
+        personalization_enabled = st.checkbox("Enable Personalized Offers", False, help="Enable dynamic bundling and loyalty-based pricing")
+        
+        with st.expander("Advanced Configuration"):
+            st.markdown("#### Optimization Settings")
+            optimization_horizons_str = st.text_input("Optimization Horizons (days, comma-sep)", "30, 14, 7, 3, 1")
+            price_update_freq = st.number_input("Price Update Frequency (hours)", value=6.0, min_value=1.0, step=1.0)
+            
+            st.markdown("#### Demand Generation")
+            demand_gen_method = st.selectbox("Demand Generation Method", ["poisson", "stateful"])
+            
+            st.markdown("#### Overbooking Settings")
+            overbooking_method = st.selectbox("Overbooking Method", ["critical_fractile", "risk_averse"])
+            overbooking_risk = st.slider("Max Denied Boarding Risk", 0.0, 0.2, 0.05, 0.01)
+            
+            st.markdown("#### Customer Behavior")
+            include_buyup_down = st.checkbox("Allow Buy-up/down", True)
+            include_recapture = st.checkbox("Allow Recapture", True)
         
         st.subheader("Currency")
         customer_currency = st.selectbox("Customer Currency", ["USD", "EUR", "GBP", "JPY", "AUD", "CAD"])
@@ -182,11 +222,27 @@ def main():
             st.error("Please select at least one airline.")
             st.stop()
             
+        # Map RM Frequency to hours
+        rm_freq_hours = 24
+        if rm_frequency == "12h":
+            rm_freq_hours = 12
+        elif rm_frequency == "6h":
+            rm_freq_hours = 6
+        elif rm_frequency == "realtime":
+            rm_freq_hours = 1
+            
+        # Parse optimization horizons
+        try:
+            opt_horizons = [int(x.strip()) for x in optimization_horizons_str.split(",")]
+        except:
+            opt_horizons = [30, 14, 7, 3, 1]
+
         # Prepare request
         payload = {
             "start_date": str(start_date),
             "end_date": str(end_date),
             "rm_method": rm_method,
+            "forecast_method": forecast_method,
             "choice_model": choice_model,
             "dynamic_pricing": dynamic_pricing,
             "overbooking": overbooking,
@@ -201,7 +257,17 @@ def main():
             "business_wtp": business_wtp,
             "leisure_wtp": leisure_wtp,
             "price_sensitivity": price_sensitivity,
-            "time_sensitivity": time_sensitivity
+            "time_sensitivity": time_sensitivity,
+            "rm_optimization_frequency": rm_freq_hours,
+            # Advanced Config
+            "optimization_horizons": opt_horizons,
+            "price_update_frequency_hours": price_update_freq,
+            "demand_generation_method": demand_gen_method,
+            "overbooking_method": overbooking_method,
+            "overbooking_risk_tolerance": overbooking_risk,
+            "include_buyup_down": include_buyup_down,
+            "include_recapture": include_recapture,
+            "personalization_enabled": personalization_enabled
         }
         
         try:
@@ -235,7 +301,8 @@ def main():
                 
                 if state == "completed":
                     st.success("Simulation Completed!")
-                    display_results(sim_id)
+                    st.session_state.sim_id = sim_id
+                    st.session_state.sim_completed = True
                     break
                 elif state == "failed":
                     st.error(f"Simulation Failed: {message}")
@@ -245,6 +312,9 @@ def main():
                 
         except Exception as e:
             st.error(f"An error occurred: {e}")
+
+    if st.session_state.sim_completed and st.session_state.sim_id:
+        display_results(st.session_state.sim_id)
 
 def display_results(sim_id):
     res = requests.get(f"{API_URL}/simulations/{sim_id}/results")
@@ -283,15 +353,38 @@ def display_results(sim_id):
     
     # Detailed Table
     st.dataframe(metrics_df)
+        
+    # Database Explorer
+    st.divider()
+    st.header("Database Explorer")
     
-    # Exported Files
-    st.subheader("Downloads")
-    if 'exported_files' in results and results['exported_files']:
-        for desc, url in results['exported_files'].items():
-            full_url = f"{API_URL}{url}"
-            st.markdown(f"[{desc}]({full_url})")
-    else:
-        st.info("No files available for download.")
+    try:
+        # Fetch tables
+        tables_res = requests.get(f"{API_URL}/simulations/{sim_id}/db/tables")
+        if tables_res.status_code == 200:
+            tables = tables_res.json().get("tables", [])
+            
+            if tables:
+                selected_table = st.selectbox("Select Table", tables)
+                
+                # Fetch data
+                data_res = requests.get(f"{API_URL}/simulations/{sim_id}/db/{selected_table}?limit=1000")
+                if data_res.status_code == 200:
+                    data = data_res.json()
+                    df = pd.DataFrame(data)
+                    st.dataframe(df)
+                    
+                    # Download CSV button
+                    csv_url = f"{API_URL}/simulations/{sim_id}/db/{selected_table}/csv"
+                    st.markdown(f"[Download {selected_table}.csv]({csv_url})")
+                else:
+                    st.error("Could not fetch table data")
+            else:
+                st.info("No tables found in database.")
+        else:
+            st.warning("Database not available for this simulation.")
+    except Exception as e:
+        st.error(f"Error connecting to database: {e}")
 
 if __name__ == "__main__":
     main()

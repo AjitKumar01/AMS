@@ -120,8 +120,8 @@ def create_airlines(routes: Dict[str, Route]) -> Dict[str, Airline]:
             arrival_time=time(11, 30),
             days_of_week=[0, 1, 2, 3, 4, 5, 6],
             aircraft=boeing_777,
-            valid_from=date(2025, 12, 1),
-            valid_until=date(2025, 12, 31)
+            valid_from=date(2020, 1, 1),
+            valid_until=date(2030, 12, 31)
         ),
         FlightSchedule(
             airline_code="AA",
@@ -131,8 +131,8 @@ def create_airlines(routes: Dict[str, Route]) -> Dict[str, Airline]:
             arrival_time=time(8, 30),
             days_of_week=[0, 1, 2, 3, 4, 5, 6],
             aircraft=airbus_a330,
-            valid_from=date(2025, 12, 1),
-            valid_until=date(2025, 12, 31)
+            valid_from=date(2020, 1, 1),
+            valid_until=date(2030, 12, 31)
         ),
         FlightSchedule(
             airline_code="AA",
@@ -142,8 +142,8 @@ def create_airlines(routes: Dict[str, Route]) -> Dict[str, Airline]:
             arrival_time=time(12, 30),
             days_of_week=[0, 1, 2, 3, 4, 5, 6],
             aircraft=boeing_777,
-            valid_from=date(2025, 12, 1),
-            valid_until=date(2025, 12, 31)
+            valid_from=date(2020, 1, 1),
+            valid_until=date(2030, 12, 31)
         )
     ]
     
@@ -170,8 +170,8 @@ def create_airlines(routes: Dict[str, Route]) -> Dict[str, Airline]:
             arrival_time=time(13, 0),
             days_of_week=[0, 1, 2, 3, 4, 5, 6],
             aircraft=boeing_777,
-            valid_from=date(2025, 12, 1),
-            valid_until=date(2025, 12, 31)
+            valid_from=date(2020, 1, 1),
+            valid_until=date(2030, 12, 31)
         ),
         FlightSchedule(
             airline_code="UA",
@@ -181,8 +181,8 @@ def create_airlines(routes: Dict[str, Route]) -> Dict[str, Airline]:
             arrival_time=time(14, 30),
             days_of_week=[0, 1, 2, 3, 4, 5, 6],
             aircraft=airbus_a330,
-            valid_from=date(2025, 12, 1),
-            valid_until=date(2025, 12, 31)
+            valid_from=date(2020, 1, 1),
+            valid_until=date(2030, 12, 31)
         ),
         FlightSchedule(
             airline_code="UA",
@@ -192,8 +192,8 @@ def create_airlines(routes: Dict[str, Route]) -> Dict[str, Airline]:
             arrival_time=time(17, 30),
             days_of_week=[0, 1, 2, 3, 4, 5, 6],
             aircraft=airbus_a330,
-            valid_from=date(2025, 12, 1),
-            valid_until=date(2025, 12, 31)
+            valid_from=date(2020, 1, 1),
+            valid_until=date(2030, 12, 31)
         )
     ]
     
@@ -220,8 +220,8 @@ def create_airlines(routes: Dict[str, Route]) -> Dict[str, Airline]:
             arrival_time=time(17, 30),
             days_of_week=[0, 1, 2, 3, 4, 5, 6],
             aircraft=boeing_777,
-            valid_from=date(2025, 12, 1),
-            valid_until=date(2025, 12, 31)
+            valid_from=date(2020, 1, 1),
+            valid_until=date(2030, 12, 31)
         ),
         FlightSchedule(
             airline_code="DL",
@@ -231,8 +231,8 @@ def create_airlines(routes: Dict[str, Route]) -> Dict[str, Airline]:
             arrival_time=time(12, 30),
             days_of_week=[0, 1, 2, 3, 4, 5, 6],
             aircraft=airbus_a330,
-            valid_from=date(2025, 12, 1),
-            valid_until=date(2025, 12, 31)
+            valid_from=date(2020, 1, 1),
+            valid_until=date(2030, 12, 31)
         )
     ]
     

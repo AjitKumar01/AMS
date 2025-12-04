@@ -12,7 +12,7 @@ This is the core simulator that coordinates:
 
 from dataclasses import dataclass, field
 from datetime import datetime, date, timedelta
-from typing import List, Dict, Optional, Any, Callable
+from typing import List, Dict, Optional, Any, Callable, Union
 from enum import Enum
 import logging
 from tqdm import tqdm
@@ -32,6 +32,7 @@ from rm.optimizer import EMSRbOptimizer, DemandForecast as OptimizerForecast
 from demand.forecaster import DemandForecaster, ForecastMethod
 from core.reservation import ReservationSystem
 from choice.frat5 import FRAT5Model
+from core.personalization import PersonalizationEngine
 
 
 class SimulationMode(Enum):
@@ -64,7 +65,7 @@ class SimulationConfig:
     mode: SimulationMode = SimulationMode.BATCH
     
     # RM settings
-    rm_optimization_frequency: str = "daily"  # 'daily', 'weekly', or hours
+    rm_optimization_frequency: Union[str, int] = "daily"  # 'daily', 'weekly', or hours (int)
     rm_method: str = "EMSR-b"  # 'EMSR-b', 'DP', 'MC', 'ML'
     optimization_horizons: List[int] = field(default_factory=lambda: [30, 14, 7, 3, 1])  # Days before departure
     
@@ -79,6 +80,7 @@ class SimulationConfig:
     
     # Demand
     demand_generation_method: str = "poisson"  # 'poisson' or 'stateful'
+    forecast_method: str = "pickup" # 'pickup', 'additive_pickup', 'exponential_smoothing'
     
     # Overbooking
     overbooking_enabled: bool = True
@@ -89,6 +91,13 @@ class SimulationConfig:
     choice_model: str = "mnl"  # 'cheapest', 'mnl', 'enhanced'
     include_buyup_down: bool = True
     include_recapture: bool = True
+    
+    # Personalization
+    personalization_enabled: bool = False
+    
+    # Database
+    use_db: bool = True
+    db_path: str = "simulation_results/simulation.db"
     
     # Snapshot settings
     snapshot_frequency_days: int = 7
@@ -246,6 +255,12 @@ class Simulator:
         if config.export_csv:
             from core.data_export import DataExporter
             self.data_exporter = DataExporter(output_dir=config.output_dir)
+            
+        # Database
+        self.db = None
+        if config.use_db:
+            from core.database import DatabaseManager
+            self.db = DatabaseManager(db_path=config.db_path)
         
         # Logging
         self._setup_logging()
@@ -299,14 +314,26 @@ class Simulator:
         self.logger.info("Initializing simulation components...")
         
         # Initialize forecaster
+        forecast_method = ForecastMethod.PICKUP
+        if self.config.forecast_method == "additive_pickup":
+            forecast_method = ForecastMethod.ADDITIVE_PICKUP
+        elif self.config.forecast_method == "exponential_smoothing":
+            forecast_method = ForecastMethod.EXPONENTIAL_SMOOTHING
+        elif self.config.forecast_method == "historical_average":
+            forecast_method = ForecastMethod.HISTORICAL_AVERAGE
+            
         self.forecaster = DemandForecaster(
-            method=ForecastMethod.PICKUP,
+            method=forecast_method,
             track_accuracy=True
         )
         
         # Initialize RM optimizer
         if self.config.rm_method == "EMSR-b":
             self.rm_optimizer = EMSRbOptimizer()
+        elif self.config.rm_method == "BidPrice":
+            from rm.bid_price_optimizer import HeuristicBidPriceOptimizer
+            self.rm_optimizer = HeuristicBidPriceOptimizer()
+            self.logger.info("Using Heuristic Bid Price Optimizer")
         else:
             # Default to EMSR-b if unknown
             self.logger.warning(f"Unknown RM method {self.config.rm_method}, defaulting to EMSR-b")
@@ -341,6 +368,11 @@ class Simulator:
             
         # Initialize FRAT5 model for sell-up logic
         self.frat5_model = FRAT5Model()
+        
+        # Initialize Personalization Engine
+        self.personalization_engine = PersonalizationEngine(
+            enabled=self.config.personalization_enabled
+        )
         
         # Create flight dates for all schedules
         self._create_flight_dates()
@@ -399,22 +431,24 @@ class Simulator:
         start_dt = datetime.combine(self.config.start_date, datetime.min.time())
         end_dt = datetime.combine(self.config.end_date, datetime.max.time())
         
-        # Schedule daily RM optimizations
-        if self.config.rm_optimization_frequency == "daily":
-            def rm_data_gen(dt: datetime) -> RMOptimizationEvent:
-                # Find flights departing in optimization horizons
-                flights_to_optimize = []
-                for horizon_days in self.config.optimization_horizons:
-                    target_date = dt.date() + timedelta(days=horizon_days)
-                    for fd in self.flight_dates.values():
-                        if fd.departure_date == target_date:
-                            flights_to_optimize.append(fd)
-                
-                return RMOptimizationEvent(
-                    flight_dates=flights_to_optimize,
-                    optimization_method=self.config.rm_method
-                )
+        # Schedule RM optimizations
+        rm_freq = self.config.rm_optimization_frequency
+        
+        def rm_data_gen(dt: datetime) -> RMOptimizationEvent:
+            # Find flights departing in optimization horizons
+            flights_to_optimize = []
+            for horizon_days in self.config.optimization_horizons:
+                target_date = dt.date() + timedelta(days=horizon_days)
+                for fd in self.flight_dates.values():
+                    if fd.departure_date == target_date:
+                        flights_to_optimize.append(fd)
             
+            return RMOptimizationEvent(
+                flight_dates=flights_to_optimize,
+                optimization_method=self.config.rm_method
+            )
+
+        if rm_freq == "daily":
             count = self.event_scheduler.schedule_daily(
                 event_type=EventType.RM_OPTIMIZATION,
                 data_generator=rm_data_gen,
@@ -423,7 +457,18 @@ class Simulator:
                 time_of_day=datetime.min.time().replace(hour=2),  # 2 AM
                 priority=EventPriority.HIGH.value
             )
-            self.logger.info(f"Scheduled {count} RM optimization events")
+            self.logger.info(f"Scheduled {count} RM optimization events (Daily)")
+        elif isinstance(rm_freq, int):
+            # Schedule at intervals
+            count = self.event_scheduler.schedule_at_intervals(
+                event_type=EventType.RM_OPTIMIZATION,
+                data_generator=rm_data_gen,
+                start_time=start_dt,
+                end_time=end_dt,
+                interval_hours=float(rm_freq),
+                priority=EventPriority.HIGH.value
+            )
+            self.logger.info(f"Scheduled {count} RM optimization events (Every {rm_freq} hours)")
         
         # Schedule snapshots
         if self.config.save_snapshots:
@@ -461,14 +506,21 @@ class Simulator:
             # Record rejected request
             if self.data_exporter:
                 self.data_exporter.add_request(request, accepted=False, 
-                                              reason="no_availability")
+                                              reason="no_availability",
+                                              solutions=solutions)
             return None
+        
+        # Enrich customer with personalization data
+        request.customer = self.personalization_engine.enrich_customer(request.customer)
         
         # Step 2: Calculate fares
         self._calculate_fares(solutions, request)
         
         # Step 3: Check availability
         self._check_availability(solutions)
+        
+        # Personalize solutions (adjust prices, create bundles)
+        solutions = self.personalization_engine.personalize_solutions(solutions, request.customer)
         
         # Step 4: Customer choice
         chosen_solution = self._customer_choice(solutions, request.customer)
@@ -481,7 +533,8 @@ class Simulator:
             # Record rejected request
             if self.data_exporter:
                 self.data_exporter.add_request(request, accepted=False, 
-                                              reason="customer_declined")
+                                              reason="customer_declined",
+                                              solutions=solutions)
             return None
         
         # Step 5: Make booking
@@ -509,8 +562,15 @@ class Simulator:
             # Record successful booking
             if self.data_exporter:
                 self.data_exporter.add_booking(booking)
-                self.data_exporter.add_request(request, accepted=True)
+                self.data_exporter.add_request(request, accepted=True,
+                                              solutions=solutions,
+                                              chosen_solution=chosen_solution)
             
+            # DB Insert
+            if self.db:
+                self.db.insert_customer(request.customer, request.request_id)
+                self.db.insert_booking(booking)
+
             # Possibly generate cancellation event
             self._maybe_generate_cancellation(booking)
         else:
@@ -518,7 +578,13 @@ class Simulator:
             # Record rejected request
             if self.data_exporter:
                 self.data_exporter.add_request(request, accepted=False, 
-                                              reason="booking_failed")
+                                              reason="booking_failed",
+                                              solutions=solutions,
+                                              chosen_solution=chosen_solution)
+            
+            # DB Insert (Customer only for rejected)
+            if self.db:
+                self.db.insert_customer(request.customer, request.request_id)
         
         return booking
     
@@ -554,6 +620,10 @@ class Simulator:
         self.results.total_cancellations += 1
         self.results.total_seats_sold -= booking.party_size
         self.results.total_revenue -= booking.total_revenue
+        
+        # DB Update
+        if self.db:
+            self.db.insert_booking(booking)
     
     def _handle_rm_optimization(self, event: Event) -> None:
         """Handle RM optimization event."""
@@ -606,19 +676,41 @@ class Simulator:
         self.results.rm_optimization_count += 1
 
     def _get_fares_for_optimization(self, flight_date: FlightDate) -> Dict[BookingClass, float]:
-        """Get fares for optimization. Simplified logic."""
+        """Get fares for optimization with realistic fare ladder."""
         fares = {}
-        base_fare = 100 + flight_date.schedule.route.distance_km * 0.10
+        # Base fare calculation: $50 fixed + $0.08 per km (approx $0.13 per mile)
+        # This represents a standard Economy (B class) fare
+        base_fare = 50 + flight_date.schedule.route.distance_km * 0.08
+        
+        # Realistic fare multipliers relative to standard Economy (B class)
+        multipliers = {
+            # First Class
+            BookingClass.F: 6.0,  # Full First
+            BookingClass.A: 5.0,  # Discount First
+            
+            # Business Class
+            BookingClass.J: 4.0,  # Full Business
+            BookingClass.C: 3.5,
+            BookingClass.D: 3.0,
+            BookingClass.I: 2.5,  # Discount Business
+            
+            # Premium Economy
+            BookingClass.W: 2.0,  # Full Premium Eco
+            BookingClass.E: 1.7,  # Discount Premium Eco
+            
+            # Economy
+            BookingClass.Y: 1.5,  # Full Fare Economy
+            BookingClass.B: 1.0,  # Standard Economy (Reference)
+            BookingClass.M: 0.9,
+            BookingClass.H: 0.8,
+            BookingClass.Q: 0.7,
+            BookingClass.K: 0.6,
+            BookingClass.L: 0.5   # Deep Discount Economy
+        }
         
         for bc in BookingClass:
-            # Simple fare structure relative to base
-            multiplier = 1.0
-            if bc in [BookingClass.F, BookingClass.A]: multiplier = 3.0
-            elif bc in [BookingClass.J, BookingClass.C]: multiplier = 2.0
-            elif bc in [BookingClass.Y, BookingClass.B]: multiplier = 1.0
-            else: multiplier = 0.7
-            
-            fares[bc] = base_fare * multiplier
+            multiplier = multipliers.get(bc, 1.0)
+            fares[bc] = round(base_fare * multiplier, 2)
             
         return fares
     
@@ -913,7 +1005,14 @@ class Simulator:
             for data_type, filepath in exported_files.items():
                 self.logger.info(f"  - {data_type}: {filepath}")
             self.logger.info(f"CSV exports complete: {len(exported_files)} files created")
-        
+            
+        # Update DB stats
+        if self.db:
+            self.logger.info("Updating database statistics...")
+            for fd in self.flight_dates.values():
+                self.db.update_flight_stats(fd)
+            self.db.update_flight_revenue_from_bookings()
+            self.logger.info("Database update complete.")
         
         return self.results
     

@@ -153,25 +153,25 @@ class DemandGenerator:
         Generate all booking requests for date range.
         
         Args:
-            start_date: Start of simulation period
-            end_date: End of simulation period
+            start_date: Start of simulation period (departure dates)
+            end_date: End of simulation period (departure dates)
             market_conditions: Optional market conditions affecting demand
             
         Returns:
             List of booking requests with timestamps
         """
         requests = []
-        current_date = start_date
+        current_departure_date = start_date
         
-        while current_date <= end_date:
-            # Generate requests for this day
-            daily_requests = self._generate_daily_requests(
-                current_date, 
-                end_date,
+        while current_departure_date <= end_date:
+            # Generate requests for this departure date
+            departure_requests = self._generate_requests_for_departure(
+                current_departure_date, 
+                start_date,
                 market_conditions
             )
-            requests.extend(daily_requests)
-            current_date += timedelta(days=1)
+            requests.extend(departure_requests)
+            current_departure_date += timedelta(days=1)
         
         self.logger.info(
             f"Generated {len(requests)} requests for {self.config.stream_id}"
@@ -179,76 +179,74 @@ class DemandGenerator:
         
         return requests
     
-    def _generate_daily_requests(
+    def _generate_requests_for_departure(
         self,
-        booking_date: date,
-        end_date: date,
+        departure_date: date,
+        simulation_start_date: date,
         market_conditions: Optional[MarketConditions] = None
     ) -> List[BookingRequest]:
-        """Generate requests for a single day."""
+        """Generate requests for a single departure date."""
         
-        # Determine expected demand for this day
-        base_demand = self.config.mean_daily_demand
+        # Determine expected demand for this departure date
+        base_demand_mean = self.config.mean_daily_demand
+        base_demand_std = self.config.demand_std
         
         # Apply day-of-week pattern
         if self.config.day_of_week_pattern:
             dow_multiplier = self.config.day_of_week_pattern.get(
-                booking_date.weekday(), 1.0
+                departure_date.weekday(), 1.0
             )
-            base_demand *= dow_multiplier
+            base_demand_mean *= dow_multiplier
+            base_demand_std *= dow_multiplier
         
         # Apply seasonality
         if self.config.seasonality:
             season_multiplier = self.config.seasonality.get(
-                booking_date.month, 1.0
+                departure_date.month, 1.0
             )
-            base_demand *= season_multiplier
+            base_demand_mean *= season_multiplier
+            base_demand_std *= season_multiplier
         
         # Apply market conditions
         if market_conditions:
-            base_demand *= market_conditions.seasonality_factor
+            base_demand_mean *= market_conditions.seasonality_factor
+            base_demand_std *= market_conditions.seasonality_factor
         
-        # Sample actual demand (Poisson)
-        num_requests = self.rng.poisson(base_demand)
+        # Sample actual total demand (Normal Distribution)
+        # Ensure non-negative
+        total_demand = max(0, int(self.rng.normal(base_demand_mean, base_demand_std)))
         
         requests = []
-        for _ in range(num_requests):
-            request = self._generate_single_request(booking_date, end_date)
+        for _ in range(total_demand):
+            request = self._generate_single_request_for_departure(
+                departure_date, 
+                simulation_start_date
+            )
             if request:
                 requests.append(request)
         
         return requests
     
-    def _generate_single_request(
+    def _generate_single_request_for_departure(
         self,
-        booking_date: date,
-        end_date: date
+        departure_date: date,
+        simulation_start_date: date
     ) -> Optional[BookingRequest]:
-        """Generate a single booking request."""
+        """Generate a single booking request for a specific departure."""
         
         # Determine customer segment
         segment = self._sample_customer_segment()
         
-        # Generate departure date based on advance purchase
-        departure_date = self._sample_departure_date(booking_date, end_date)
-        if departure_date is None:
-            return None
+        # Sample advance purchase days (booking curve)
+        dtd = self._sample_dtd_from_curve(segment)
         
-        # Calculate days to departure
-        dtd = (departure_date - booking_date).days
-        
-        # Apply booking curve - reject if demand is low for this DTD
-        booking_curve = self.config.get_default_booking_curve()
-        curve_multiplier = booking_curve.get(dtd, 0.5)
-        
-        # Probabilistic rejection based on booking curve
-        if self.rng.random() > curve_multiplier:
-            return None
+        # Calculate booking date
+        booking_date = departure_date - timedelta(days=dtd)
         
         # Generate customer
         customer = self._generate_customer(segment, dtd)
         
-        # Generate request timestamp (random time during day)
+        # Generate request timestamp (random time during booking day)
         hour = self.rng.integers(0, 24)
         minute = self.rng.integers(0, 60)
         second = self.rng.integers(0, 60)
@@ -300,13 +298,61 @@ class DemandGenerator:
         self.requests_by_segment[segment] += 1
         
         return request
+
+    def _sample_dtd_from_curve(self, segment: CustomerSegment) -> int:
+        """Sample Days To Departure based on booking curve and segment."""
+        
+        if segment == CustomerSegment.BUSINESS:
+            # Business books late (0-14 days)
+            mean = 7.0
+            std = 5.0
+        elif segment == CustomerSegment.LEISURE:
+            # Leisure books early (21-60 days)
+            mean = 45.0
+            std = 20.0
+        elif segment == CustomerSegment.PREMIUM_LEISURE:
+            # Premium Leisure books moderately early (14-45 days)
+            mean = 30.0
+            std = 15.0
+        elif segment == CustomerSegment.VFR:
+            # VFR books very early or very late (bimodal), simplified to early
+            mean = 60.0
+            std = 30.0
+        else: # Group
+            mean = 90.0
+            std = 30.0
+            
+        advance_days = self.rng.normal(mean, std)
+        
+        return int(np.clip(
+            advance_days,
+            self.config.min_advance_days,
+            self.config.max_advance_days
+        ))
+        
+        return request
     
     def _sample_customer_segment(self) -> CustomerSegment:
         """Sample customer segment."""
-        if self.rng.random() < self.config.business_proportion:
+        rand = self.rng.random()
+        
+        # Default proportions if not specified in config
+        # Business: 30%, Leisure: 40%, Premium Leisure: 15%, VFR: 10%, Group: 5%
+        
+        # Use config business proportion as anchor
+        biz_prop = self.config.business_proportion
+        remaining = 1.0 - biz_prop
+        
+        if rand < biz_prop:
             return CustomerSegment.BUSINESS
-        else:
+        elif rand < biz_prop + (remaining * 0.5): # 50% of remaining is Leisure
             return CustomerSegment.LEISURE
+        elif rand < biz_prop + (remaining * 0.75): # 25% of remaining is Premium Leisure
+            return CustomerSegment.PREMIUM_LEISURE
+        elif rand < biz_prop + (remaining * 0.9): # 15% of remaining is VFR
+            return CustomerSegment.VFR
+        else:
+            return CustomerSegment.GROUP
     
     def _sample_departure_date(
         self,
@@ -345,20 +391,33 @@ class DemandGenerator:
         
         # Willingness to pay (log-normal distribution)
         if segment == CustomerSegment.BUSINESS:
-            wtp = self.rng.lognormal(
-                mean=np.log(self.config.business_wtp_mean),
-                sigma=self.config.business_wtp_std / self.config.business_wtp_mean
-            )
-        else:
-            wtp = self.rng.lognormal(
-                mean=np.log(self.config.leisure_wtp_mean),
-                sigma=self.config.leisure_wtp_std / self.config.leisure_wtp_mean
-            )
+            mean_wtp = self.config.business_wtp_mean
+            std_wtp = self.config.business_wtp_std
+        elif segment == CustomerSegment.PREMIUM_LEISURE:
+            mean_wtp = self.config.leisure_wtp_mean * 1.5
+            std_wtp = self.config.leisure_wtp_std * 1.2
+        elif segment == CustomerSegment.VFR:
+            mean_wtp = self.config.leisure_wtp_mean * 0.8
+            std_wtp = self.config.leisure_wtp_std
+        elif segment == CustomerSegment.GROUP:
+            mean_wtp = self.config.leisure_wtp_mean * 0.7
+            std_wtp = self.config.leisure_wtp_std * 0.5
+        else: # LEISURE
+            mean_wtp = self.config.leisure_wtp_mean
+            std_wtp = self.config.leisure_wtp_std
+            
+        wtp = self.rng.lognormal(
+            mean=np.log(mean_wtp),
+            sigma=std_wtp / mean_wtp
+        )
         
         # Price sensitivity (leisure more price sensitive)
         if segment == CustomerSegment.BUSINESS:
             price_sensitivity = self.rng.uniform(0.5, 1.0)
             time_sensitivity = self.rng.uniform(1.0, 1.5)
+        elif segment == CustomerSegment.PREMIUM_LEISURE:
+            price_sensitivity = self.rng.uniform(0.8, 1.2)
+            time_sensitivity = self.rng.uniform(0.8, 1.2)
         else:
             price_sensitivity = self.rng.uniform(1.0, 1.8)
             time_sensitivity = self.rng.uniform(0.5, 1.0)
@@ -390,14 +449,17 @@ class DemandGenerator:
     def _sample_preferred_cabin(self, segment: CustomerSegment) -> CabinClass:
         """Sample preferred cabin class."""
         
-        # Business travelers prefer higher cabins
-        if segment == CustomerSegment.BUSINESS:
-            probs = [0.10, 0.40, 0.20, 0.30]  # F, J, W, Y
-        else:
-            probs = [0.02, 0.08, 0.10, 0.80]  # F, J, W, Y
-        
         cabins = [CabinClass.FIRST, CabinClass.BUSINESS, 
                   CabinClass.PREMIUM_ECONOMY, CabinClass.ECONOMY]
+
+        if segment == CustomerSegment.BUSINESS:
+            probs = [0.10, 0.40, 0.20, 0.30]  # F, J, W, Y
+        elif segment == CustomerSegment.PREMIUM_LEISURE:
+            probs = [0.05, 0.15, 0.40, 0.40]
+        elif segment == CustomerSegment.VFR:
+            probs = [0.01, 0.04, 0.05, 0.90]
+        else: # Leisure & Group
+            probs = [0.02, 0.08, 0.10, 0.80]
         
         return self.rng.choice(cabins, p=probs)
     
@@ -429,6 +491,14 @@ class DemandGenerator:
                 BookingChannel.CALL_CENTER
             ]
             probs = [0.30, 0.20, 0.25, 0.20, 0.05]
+        elif segment == CustomerSegment.PREMIUM_LEISURE:
+             channels = [
+                BookingChannel.DIRECT_ONLINE,
+                BookingChannel.DIRECT_MOBILE,
+                BookingChannel.OTA,
+                BookingChannel.CALL_CENTER
+            ]
+             probs = [0.40, 0.30, 0.25, 0.05]
         else:
             # Leisure use more OTA
             channels = [

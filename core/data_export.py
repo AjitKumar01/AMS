@@ -51,6 +51,7 @@ class DataExporter:
         # Data collectors
         self.bookings: List[Booking] = []
         self.requests: List[BookingRequest] = []
+        self.detailed_requests: List[Dict[str, Any]] = []
         self.flight_snapshots: List[Dict[str, Any]] = []
         self.revenue_timeline: List[Dict[str, Any]] = []
         
@@ -60,11 +61,21 @@ class DataExporter:
         """Record a booking."""
         self.bookings.append(booking)
     
-    def add_request(self, request: BookingRequest, accepted: bool, reason: str = "") -> None:
+    def add_request(self, request: BookingRequest, accepted: bool, reason: str = "",
+                   solutions: List[Any] = None, chosen_solution: Any = None) -> None:
         """Record a booking request."""
         request.accepted = accepted
         request.rejection_reason = reason if not accepted else ""
         self.requests.append(request)
+        
+        # Store detailed info
+        self.detailed_requests.append({
+            'request': request,
+            'accepted': accepted,
+            'reason': reason,
+            'solutions': solutions,
+            'chosen_solution': chosen_solution
+        })
     
     def add_flight_snapshot(self, flight: FlightDate, timestamp: datetime) -> None:
         """Record flight state at a point in time."""
@@ -104,11 +115,12 @@ class DataExporter:
             
             # Header
             writer.writerow([
-                'booking_id', 'booking_time', 'departure_date', 'flight_code',
+                'booking_id', 'request_id', 'booking_time', 'departure_date', 'flight_code',
                 'origin', 'destination', 'cabin_class', 'booking_class',
                 'customer_segment', 'party_size', 'base_fare', 'total_paid',
                 'days_to_departure', 'willingness_to_pay', 'price_sensitivity',
-                'cancelled', 'cancellation_time'
+                'cancelled', 'cancellation_time',
+                'loyalty_tier', 'ancillaries', 'is_personalized'
             ])
             
             # Data
@@ -141,8 +153,26 @@ class DataExporter:
                 booking_class = booking.solution.booking_classes[0].value \
                     if (booking.solution and booking.solution.booking_classes) else ''
                 
+                # Personalization data
+                loyalty_tier = ''
+                if hasattr(booking.customer, 'loyalty_tier') and booking.customer.loyalty_tier:
+                    loyalty_tier = booking.customer.loyalty_tier.value if hasattr(booking.customer.loyalty_tier, 'value') else str(booking.customer.loyalty_tier)
+                
+                ancillaries = ''
+                if hasattr(booking, 'ancillaries') and booking.ancillaries:
+                    ancillaries = "|".join(booking.ancillaries)
+                
+                is_personalized = False
+                if hasattr(booking, 'is_personalized_offer'):
+                    is_personalized = booking.is_personalized_offer
+                
+                request_id = ''
+                if booking.original_request:
+                    request_id = booking.original_request.request_id
+
                 writer.writerow([
                     booking.booking_id,
+                    request_id,
                     booking.booking_time.isoformat() if booking.booking_time else '',
                     departure_date.isoformat() if departure_date else '',
                     flight_code,
@@ -158,7 +188,10 @@ class DataExporter:
                     f"{booking.customer.willingness_to_pay:.2f}" if booking.customer else '',
                     f"{booking.customer.price_sensitivity:.2f}" if booking.customer else '',
                     booking.is_cancelled,
-                    booking.cancellation_time.isoformat() if booking.cancellation_time else ''
+                    booking.cancellation_time.isoformat() if booking.cancellation_time else '',
+                    loyalty_tier,
+                    ancillaries,
+                    is_personalized
                 ])
         
         logger.info(f"Exported {len(self.bookings)} bookings to {filepath}")
@@ -182,13 +215,23 @@ class DataExporter:
                 'origin', 'destination', 'preferred_cabin', 'preferred_class',
                 'customer_segment', 'party_size', 'willingness_to_pay',
                 'price_sensitivity', 'time_sensitivity', 'days_to_departure',
-                'accepted', 'rejection_reason'
+                'accepted', 'rejection_reason',
+                'loyalty_tier', 'ancillary_prefs'
             ])
             
             # Data
             for req in self.requests:
                 dtd = (req.departure_date - req.request_time.date()).days
                 
+                # Personalization data
+                loyalty_tier = ''
+                if hasattr(req.customer, 'loyalty_tier') and req.customer.loyalty_tier:
+                    loyalty_tier = req.customer.loyalty_tier.value if hasattr(req.customer.loyalty_tier, 'value') else str(req.customer.loyalty_tier)
+                
+                ancillary_prefs = ''
+                if hasattr(req.customer, 'ancillary_preferences') and req.customer.ancillary_preferences:
+                    ancillary_prefs = "|".join(req.customer.ancillary_preferences)
+
                 writer.writerow([
                     req.request_id,
                     req.request_time.isoformat(),
@@ -204,10 +247,149 @@ class DataExporter:
                     f"{req.customer.time_sensitivity:.2f}",
                     dtd,
                     getattr(req, 'accepted', False),
-                    getattr(req, 'rejection_reason', '')
+                    getattr(req, 'rejection_reason', ''),
+                    loyalty_tier,
+                    ancillary_prefs
                 ])
         
         logger.info(f"Exported {len(self.requests)} requests to {filepath}")
+        return str(filepath)
+    
+    def export_customers(self, filename: str = "customers.csv") -> str:
+        """
+        Export customer details linked to requests.
+        
+        Returns:
+            Path to created file
+        """
+        filepath = self.output_dir / filename
+        
+        with open(filepath, 'w', newline='') as f:
+            writer = csv.writer(f)
+            
+            # Header
+            writer.writerow([
+                'customer_id', 'request_id', 'segment', 
+                'willingness_to_pay', 'price_sensitivity', 'time_sensitivity',
+                'loyalty_tier', 'ancillary_prefs'
+            ])
+            
+            # Data
+            for req in self.requests:
+                if not req.customer:
+                    continue
+                    
+                # Personalization data
+                loyalty_tier = ''
+                if hasattr(req.customer, 'loyalty_tier') and req.customer.loyalty_tier:
+                    loyalty_tier = req.customer.loyalty_tier.value if hasattr(req.customer.loyalty_tier, 'value') else str(req.customer.loyalty_tier)
+                
+                ancillary_prefs = ''
+                if hasattr(req.customer, 'ancillary_preferences') and req.customer.ancillary_preferences:
+                    ancillary_prefs = "|".join(req.customer.ancillary_preferences)
+
+                writer.writerow([
+                    req.customer.customer_id,
+                    req.request_id,
+                    req.customer.segment.value,
+                    f"{req.customer.willingness_to_pay:.2f}",
+                    f"{req.customer.price_sensitivity:.2f}",
+                    f"{req.customer.time_sensitivity:.2f}",
+                    loyalty_tier,
+                    ancillary_prefs
+                ])
+        
+        logger.info(f"Exported {len(self.requests)} customers to {filepath}")
+        return str(filepath)
+    
+    def export_raw_bookings(self, filename: str = "raw_bookings.csv") -> str:
+        """
+        Export detailed raw booking data including options and inventory.
+        
+        Returns:
+            Path to created file
+        """
+        filepath = self.output_dir / filename
+        
+        with open(filepath, 'w', newline='') as f:
+            writer = csv.writer(f)
+            
+            # Header
+            writer.writerow([
+                'request_id', 'request_time', 'departure_date', 'days_to_departure',
+                'customer_segment', 'willingness_to_pay', 'party_size',
+                'accepted', 'rejection_reason',
+                'chosen_price', 'chosen_class',
+                'offered_options_count', 'offered_options_details',
+                'inventory_at_booking'
+            ])
+            
+            # Data
+            for detail in self.detailed_requests:
+                req = detail['request']
+                solutions = detail['solutions']
+                chosen = detail['chosen_solution']
+                
+                dtd = (req.departure_date - req.request_time.date()).days
+                
+                # Chosen details
+                chosen_price = ''
+                chosen_class = ''
+                if chosen:
+                    chosen_price = f"{chosen.total_price:.2f}"
+                    if chosen.booking_classes:
+                        chosen_class = chosen.booking_classes[0].value
+                
+                # Offered options details
+                options_count = 0
+                options_str = ''
+                inventory_str = ''
+                
+                if solutions:
+                    options_count = len(solutions)
+                    # Create a summary string of options: "Class:Price:Seats|..."
+                    opts = []
+                    invs = []
+                    for sol in solutions:
+                        if not sol.booking_classes:
+                            continue
+                        bc = sol.booking_classes[0].value
+                        price = sol.total_price
+                        seats = sol.available_seats
+                        opts.append(f"{bc}:${price:.0f}")
+                        
+                        # Inventory details (from the first flight in solution)
+                        if sol.flights:
+                            flight = sol.flights[0]
+                            # Snapshot of inventory for this flight
+                            # Format: Class:Booked/Cap
+                            flight_inv = []
+                            for cabin, cap in flight.capacity.items():
+                                booked = flight.total_bookings(cabin)
+                                flight_inv.append(f"{cabin.value}:{booked}/{cap}")
+                            invs.append(f"{flight.schedule.flight_code}({' '.join(flight_inv)})")
+                    
+                    options_str = "|".join(opts)
+                    inventory_str = "; ".join(set(invs)) # Unique flights
+                
+                writer.writerow([
+                    req.request_id,
+                    req.request_time.isoformat(),
+                    req.departure_date.isoformat(),
+                    dtd,
+                    req.customer.segment.value,
+                    f"{req.customer.willingness_to_pay:.2f}",
+                    req.party_size,
+                    detail['accepted'],
+                    detail['reason'],
+                    chosen_price,
+                    chosen_class,
+                    options_count,
+                    options_str,
+                    inventory_str
+                ])
+        
+        logger.info(f"Exported {len(self.detailed_requests)} raw bookings to {filepath}")
         return str(filepath)
     
     def export_dtd_analysis(self, filename: str = "dtd_analysis.csv") -> str:
@@ -482,6 +664,8 @@ class DataExporter:
         
         if self.requests:
             exports['requests'] = self.export_requests()
+            exports['customers'] = self.export_customers()
+            exports['raw_bookings'] = self.export_raw_bookings()
         
         if self.revenue_timeline:
             exports['revenue_timeline'] = self.export_revenue_timeline()
