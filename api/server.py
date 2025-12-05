@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.simulator import Simulator, SimulationConfig
 from core.models import BookingClass
 from demand.forecaster import DemandForecaster, ForecastMethod
-from demand.generator import MultiStreamDemandGenerator
+from demand.generator import MultiStreamDemandGenerator, generate_default_holidays
 from inventory.network import NetworkOptimizer
 from competition.market import Market
 
@@ -71,6 +71,7 @@ class SimulationRequest(BaseModel):
     selected_airlines: List[str] = Field(default=["AA", "UA", "DL"])
     demand_pattern: str = Field(default="default", description="default, high_business, high_leisure")
     single_flight_mode: bool = Field(default=False, description="Simulate only one route (JFK-LAX)")
+    enable_holidays: bool = Field(default=True, description="Enable holiday demand seasonality")
     customer_currency: str = Field(default="USD")
     base_currency: str = Field(default="USD")
     
@@ -242,8 +243,19 @@ def run_simulation_task(sim_id: str, request: SimulationRequest):
         if request.single_flight_mode:
              demand_streams = [s for s in demand_streams if s.origin.code == 'JFK' and s.destination.code == 'LAX']
         
+        # Generate holidays if enabled
+        holidays = {}
+        if request.enable_holidays:
+            years = list(range(request.start_date.year, request.end_date.year + 1))
+            holidays = generate_default_holidays(years)
+            logger.info(f"Generated {len(holidays)} holiday dates for years {years}")
+
         # Apply demand pattern adjustments
         for stream in demand_streams:
+            # Apply holidays
+            if request.enable_holidays:
+                stream.holidays = holidays
+
             # Use explicit mean/std from request
             stream.mean_daily_demand = request.demand_mean * request.demand_multiplier
             stream.demand_std = request.demand_std

@@ -50,6 +50,7 @@ class DemandStreamConfig:
     # Temporal patterns
     seasonality: Optional[Dict[int, float]] = None  # {month: multiplier}
     day_of_week_pattern: Optional[Dict[int, float]] = None  # {0-6: multiplier}
+    holidays: Optional[Dict[date, float]] = None  # {date: multiplier}
     
     # Advanced booking window
     mean_advance_purchase: float = 21.0  # Days
@@ -73,6 +74,54 @@ class DemandStreamConfig:
     ota_proportion: float = 0.20
     gds_proportion: float = 0.10
     call_center_proportion: float = 0.05
+
+    def __post_init__(self):
+        """Initialize default patterns if not provided."""
+        if self.seasonality is None:
+            self.seasonality = self.get_default_seasonality()
+        if self.day_of_week_pattern is None:
+            self.day_of_week_pattern = self.get_default_dow_pattern()
+        if self.booking_curve is None:
+            self.booking_curve = self.get_default_booking_curve()
+    
+    def get_default_seasonality(self) -> Dict[int, float]:
+        """
+        Generate default monthly seasonality factors.
+        
+        Based on typical northern hemisphere travel patterns:
+        - Summer peak (Jun-Aug)
+        - Winter holiday peak (Dec)
+        - Shoulder seasons (Jan-Feb, Sep-Nov)
+        """
+        return {
+            1: 0.85,  # Jan: Post-holiday slump
+            2: 0.90,  # Feb: Low season
+            3: 1.00,  # Mar: Spring break start
+            4: 1.05,  # Apr: Spring
+            5: 1.05,  # May: Pre-summer
+            6: 1.20,  # Jun: Summer start
+            7: 1.30,  # Jul: Summer peak
+            8: 1.30,  # Aug: Summer peak
+            9: 1.00,  # Sep: Back to school
+            10: 1.00, # Oct: Fall
+            11: 0.95, # Nov: Pre-holiday (excluding Thanksgiving)
+            12: 1.25  # Dec: Holiday season
+        }
+
+    def get_default_dow_pattern(self) -> Dict[int, float]:
+        """
+        Generate default day-of-week demand multipliers.
+        0=Monday, 6=Sunday.
+        """
+        return {
+            0: 1.10,  # Mon: High business demand
+            1: 0.90,  # Tue: Low demand
+            2: 0.90,  # Wed: Low demand
+            3: 1.00,  # Thu: Moderate demand
+            4: 1.25,  # Fri: High business/leisure
+            5: 0.85,  # Sat: Low business, moderate leisure
+            6: 1.15   # Sun: High leisure return
+        }
     
     def get_default_booking_curve(self) -> Dict[int, float]:
         """
@@ -206,6 +255,12 @@ class DemandGenerator:
             )
             base_demand_mean *= season_multiplier
             base_demand_std *= season_multiplier
+            
+        # Apply holidays
+        if self.config.holidays:
+            holiday_multiplier = self.config.holidays.get(departure_date, 1.0)
+            base_demand_mean *= holiday_multiplier
+            base_demand_std *= holiday_multiplier
         
         # Apply market conditions
         if market_conditions:
@@ -631,3 +686,97 @@ class MultiStreamDemandGenerator:
         stats['total_requests'] = total_requests
         
         return stats
+
+
+def generate_default_holidays(years: List[int]) -> Dict[date, float]:
+    """
+    Generate default holiday multipliers for given years.
+    
+    Includes:
+    - New Year's (Low on day, High after)
+    - Valentine's Day (Minor bump)
+    - July 4th (US Independence Day)
+    - Christmas Season (High before/after, Low on day)
+    """
+    holidays = {}
+    for year in years:
+        # New Year's
+        holidays[date(year, 1, 1)] = 0.6  # Low demand on actual day
+        holidays[date(year, 1, 2)] = 1.4  # Return travel
+        holidays[date(year, 1, 3)] = 1.3
+        
+        # Valentine's (minor bump)
+        holidays[date(year, 2, 14)] = 1.1
+        
+        # Easter (Western) - Computus Algorithm
+        a = year % 19
+        b = year // 100
+        c = year % 100
+        d = b // 4
+        e = b % 4
+        f = (b + 8) // 25
+        g = (b - f + 1) // 3
+        h = (19 * a + b - d - g + 15) % 30
+        i = c // 4
+        k = c % 4
+        l = (32 + 2 * e + 2 * i - h - k) % 7
+        m = (a + 11 * h + 22 * l) // 451
+        month = (h + l - 7 * m + 114) // 31
+        day = ((h + l - 7 * m + 114) % 31) + 1
+        easter_sunday = date(year, month, day)
+        
+        holidays[easter_sunday] = 0.8  # Low travel on Sunday itself
+        holidays[easter_sunday - timedelta(days=2)] = 1.3  # Good Friday
+        holidays[easter_sunday + timedelta(days=1)] = 1.2  # Easter Monday
+        
+        # Memorial Day (US) - Last Monday of May
+        may_31 = date(year, 5, 31)
+        # weekday(): Mon=0. Days to subtract to get to Mon: may_31.weekday()
+        memorial_day = may_31 - timedelta(days=may_31.weekday())
+        holidays[memorial_day] = 0.7
+        holidays[memorial_day - timedelta(days=3)] = 1.3  # Friday before
+        
+        # July 4th (US)
+        holidays[date(year, 7, 4)] = 0.7
+        holidays[date(year, 7, 3)] = 1.2
+        holidays[date(year, 7, 5)] = 1.2
+        
+        # Labor Day (US) - 1st Monday of September
+        sep_1 = date(year, 9, 1)
+        days_to_mon = (0 - sep_1.weekday() + 7) % 7
+        labor_day = sep_1 + timedelta(days=days_to_mon)
+        holidays[labor_day] = 0.7
+        holidays[labor_day - timedelta(days=3)] = 1.3 # Friday before
+        
+        # Thanksgiving (US) - 4th Thursday of November
+        # Calculate 4th Thursday
+        nov_1 = date(year, 11, 1)
+        # weekday(): Mon=0, Thu=3
+        # Days to first Thursday: (3 - nov_1.weekday() + 7) % 7
+        days_to_first_thu = (3 - nov_1.weekday() + 7) % 7
+        first_thu = nov_1 + timedelta(days=days_to_first_thu)
+        thanksgiving = first_thu + timedelta(weeks=3)
+        
+        holidays[thanksgiving] = 0.6  # Low demand on actual day
+        holidays[thanksgiving - timedelta(days=1)] = 1.5  # Wed before (Peak travel)
+        holidays[thanksgiving + timedelta(days=3)] = 1.5  # Sun after (Peak return)
+        
+        # Christmas Season
+        # Pre-holiday rush
+        for d in range(20, 25):
+            try:
+                holidays[date(year, 12, d)] = 1.4
+            except ValueError:
+                pass
+                
+        # Christmas Day
+        holidays[date(year, 12, 25)] = 0.5
+        
+        # Post-holiday / Pre-NYE
+        for d in range(26, 31):
+            try:
+                holidays[date(year, 12, d)] = 1.2
+            except ValueError:
+                pass
+            
+    return holidays

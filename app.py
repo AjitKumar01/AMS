@@ -93,6 +93,7 @@ def main():
         st.subheader("Features")
         dynamic_pricing = st.checkbox("Dynamic Pricing", True)
         overbooking = st.checkbox("Overbooking", True)
+        enable_holidays = st.checkbox("Enable Holidays", True, help="Include major holidays (New Year, Easter, Thanksgiving, etc.) in demand generation")
         personalization_enabled = st.checkbox("Enable Personalized Offers", False, help="Enable dynamic bundling and loyalty-based pricing")
         
         with st.expander("Advanced Configuration"):
@@ -246,6 +247,7 @@ def main():
             "choice_model": choice_model,
             "dynamic_pricing": dynamic_pricing,
             "overbooking": overbooking,
+            "enable_holidays": enable_holidays,
             "demand_multiplier": demand_multiplier,
             "random_seed": 42,
             "selected_airlines": selected_airlines,
