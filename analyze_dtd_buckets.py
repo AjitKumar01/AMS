@@ -8,7 +8,7 @@ import os
 def analyze_dtd_buckets():
     print("Analyzing DTD buckets...")
     
-    file_path = "simulation_results/downloaded_bookings.csv"
+    file_path = "/Users/ajit/Desktop/Github Projects/pyairline_rm/simulation_results/bookings-5.csv"
     if not os.path.exists(file_path):
         print(f"File not found: {file_path}")
         return
